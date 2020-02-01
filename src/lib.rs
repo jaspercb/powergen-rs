@@ -6,8 +6,10 @@ extern crate strum_macros;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
-
 type Vec2d = u16;
+
+trait NodeState: Default {}
+impl<T: Default> NodeState for T {}
 
 #[derive(Debug, Copy, Clone, EnumDiscriminants)]
 enum Atom {
@@ -20,7 +22,7 @@ enum Atom {
 
 struct Link {
     latest_value: Option<Atom>,
-    callbacks: Vec<Rc<dyn NodeCallback>>,
+    callbacks: Vec<Rc<dyn CallbackParameter>>,
 }
 
 impl Link {
@@ -36,30 +38,105 @@ impl Link {
     fn get_latest(&self) -> Option<Atom> {
         self.latest_value
     }
-    fn add_callback(&mut self, callback: Rc<dyn NodeCallback>) {
+    fn add_callback(&mut self, callback: Rc<dyn CallbackParameter>) {
         self.callbacks.push(callback);
     }
 }
 
-trait NodeTemplate<DataT> {
+/* Defines behavior and the shape of node state.
+ * Each Node in a power graph has a reference to
+ */
+trait NodeTemplate<StateT: NodeState> {
     fn in_types(&self) -> Vec<AtomDiscriminants>;
     fn out_types(&self) -> Vec<AtomDiscriminants>;
-    fn callbacks(&self) -> Vec<Rc<dyn Fn(Rc<RefCell<DataT>>, Atom)>>;
+    fn callbacks(&self) -> Vec<Rc<dyn Fn(Rc<RefCell<StateT>>, Atom)>>;
 }
 
-struct Node<DataT> {
-    in_links: Vec<Option<Rc<RefCell<Link>>>>,
+struct Node<StateT: NodeState> {
+    in_links: Vec<Rc<RefCell<Link>>>,
     out_links: Vec<Option<Rc<RefCell<Link>>>>,
-    template: Rc<dyn NodeTemplate<DataT>>,
-    data: Rc<RefCell<DataT>>,
+    template: Rc<dyn NodeTemplate<StateT>>,
+    state: Rc<RefCell<StateT>>,
+    callback_params: Vec<Rc<dyn CallbackParameter>>,
 }
 
+impl<StateT: NodeState + 'static> Node<StateT> {
+    pub fn from_template(template: Rc<dyn NodeTemplate<StateT>>) -> Rc<RefCell<Node<StateT>>> {
+        let in_links = template
+            .in_types()
+            .iter()
+            .map(|_typ| Rc::new(RefCell::new(Link::new())))
+            .collect();
+        let out_links = template.out_types().iter().map(|_typ| None).collect();
+        let state = Rc::new(RefCell::new(Default::default()));
+        let ret = Rc::new(RefCell::new(Self {
+            in_links,
+            out_links,
+            template: template.clone(),
+            state,
+            callback_params: Vec::new(),
+        }));
 
-// TODO: pair Node<T> and NodeTemplate<T> together behind a trait?
-// Trait supports
+        ret.borrow_mut().callback_params = in_params(&ret)
+            .into_iter()
+            .map(|param: InputParameter<StateT>| Rc::new(param) as Rc<dyn CallbackParameter>)
+            .collect();
+        return ret;
+    }
+}
 
-impl<T> Node<T> {
+struct InputParameter<StateT: NodeState> {
+    node: Rc<RefCell<Node<StateT>>>,
+    idx: usize,
+    typ: AtomDiscriminants,
+}
 
+fn in_params<T: NodeState>(node: &Rc<RefCell<Node<T>>>) -> Vec<InputParameter<T>> {
+    node.borrow()
+        .template
+        .in_types()
+        .iter()
+        .enumerate()
+        .map(|(idx, typ)| InputParameter {
+            node: node.clone(),
+            idx,
+            typ: *typ,
+        })
+        .collect()
+}
+
+// Basically still an input parameter
+trait CallbackParameter {
+    fn call(&self, atom: Atom) -> ();
+}
+
+impl<StateT: NodeState> CallbackParameter for InputParameter<StateT> {
+    fn call(&self, atom: Atom) -> () {
+        self.node.borrow_mut().template.callbacks()[self.idx](
+            self.node.borrow().state.clone(),
+            atom,
+        );
+    }
+}
+
+struct OutputParameter<StateT: NodeState> {
+    node: Rc<RefCell<Node<StateT>>>,
+    idx: usize,
+    typ: AtomDiscriminants,
+}
+
+fn out_params<T: NodeState>(node: Rc<RefCell<Node<T>>>) -> Vec<OutputParameter<T>> {
+    node.borrow()
+        .template
+        .out_types()
+        .iter()
+        .enumerate()
+        .map(|(idx, typ)| OutputParameter {
+            node: node.clone(),
+            idx,
+            typ: *typ,
+        })
+        .collect()
 }
 
 // trait NodeState
@@ -83,43 +160,28 @@ impl<T> Node<T> {
  *   This doesn't necessarily make a ton of sense
  */
 
-trait NodeCallback {
-    fn call(&self, atom: Atom) -> ();
-}
-
-#[derive(Clone)]
-struct NodeInputCallback<T> {
-    node: Rc<RefCell<Node<T>>>,
-    idx: usize,
-}
-
-impl<DataT> NodeCallback for NodeInputCallback<DataT> {
-    fn call(&self, atom: Atom) -> () {
-        self.node.borrow_mut().template.callbacks()[self.idx](self.node.borrow().data.clone(), atom);
-    }
-}
-
-fn attach<A, B: 'static>(ref_src: Rc<RefCell<Node<A>>>, out_idx: usize, ref_sink: Rc<RefCell<Node<B>>>, in_idx: usize) {
-    let mut src = ref_src.borrow_mut();
-    let mut sink = ref_sink.borrow_mut();
+// fn attach<A: NodeState, B: NodeState>(ref_src: Rc<RefCell<Node<A>>>, out_idx: usize, ref_sink: Rc<RefCell<Node<B>>>, in_idx: usize) {
+fn attach<A: NodeState, B: NodeState>(from_param: OutputParameter<A>, to_param: InputParameter<B>) {
+    let mut src = from_param.node.borrow_mut();
+    let mut sink = to_param.node.borrow_mut();
 
     // Assert the output of src and the input of sink are the same type.
-    let out_type = src.template.out_types()[out_idx];
-    let in_type = sink.template.in_types()[in_idx];
-    assert!(out_type == in_type);
+    assert!(from_param.typ == to_param.typ);
 
     // If it doesn't already exist, create a link associated with source.
-    if src.out_links[out_idx].is_none() {
-        src.out_links[out_idx] = Some(Rc::new(RefCell::new(Link::new())));
+    if src.out_links[from_param.idx].is_none() {
+        src.out_links[from_param.idx] = Some(Rc::new(RefCell::new(Link::new())));
     }
 
-    src.out_links[out_idx].as_ref().unwrap().borrow_mut().add_callback(
-        Rc::new(NodeInputCallback {
-            node: ref_sink.clone(), idx: in_idx,
-        })
-    );
+    let callback = sink.callback_params[to_param.idx].clone();
 
-    // Add the sink as a listener.
+    src.out_links[from_param.idx]
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .add_callback(callback);
+
+    // TODO: Add the sink as a listener.
 }
 
 /* What do I need to specify a node?
@@ -134,6 +196,7 @@ fn attach<A, B: 'static>(ref_src: Rc<RefCell<Node<A>>>, out_idx: usize, ref_sink
  */
 
 #[cfg(test)]
+#[derive(Default)]
 struct TestEmitUsizeSignature {}
 
 #[cfg(test)]
@@ -153,6 +216,7 @@ impl NodeTemplate<TestEmitUsizeSignature> for TestEmitUsizeSignatureTemplate {
 }
 
 #[cfg(test)]
+#[derive(Default)]
 struct TestTakeUsizeSignature {
     received: usize,
 }
@@ -169,14 +233,12 @@ impl NodeTemplate<TestTakeUsizeSignature> for TestTakeUsizeSignatureTemplate {
         vec![]
     }
     fn callbacks(&self) -> Vec<Rc<dyn Fn(Rc<RefCell<TestTakeUsizeSignature>>, Atom)>> {
-        vec![
-            Rc::new(|state: Rc<RefCell<TestTakeUsizeSignature>>, atom: Atom| {
-                match atom {
-                    Atom::TestUsize(v) => state.borrow_mut().received = v,
-                    _ => ()
-                }
-            })
-        ]
+        vec![Rc::new(
+            |state: Rc<RefCell<TestTakeUsizeSignature>>, atom: Atom| match atom {
+                Atom::TestUsize(v) => state.borrow_mut().received = v,
+                _ => (),
+            },
+        )]
     }
 }
 
@@ -185,6 +247,5 @@ mod tests {
     #[test]
     fn it_works() {
         // let sig = TestTakeUsizeSignature
-
     }
 }
