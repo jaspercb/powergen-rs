@@ -3,13 +3,12 @@ extern crate strum;
 #[macro_use]
 extern crate strum_macros;
 
-use std::cell::RefCell;
-use std::sync::{Arc, Weak};
 use std::any::Any;
+use std::cell::RefCell;
+use std::fmt::Debug;
+use std::sync::{Arc, Weak};
 
 use weak_self::WeakSelf;
-
-type Vec2d = u16;
 
 #[derive(Debug, Copy, Clone, EnumDiscriminants)]
 enum Atom {
@@ -20,9 +19,9 @@ enum Atom {
     TestUsize(usize),
 }
 
-/* Link: Basically a broadcast event bus.
+/* Link: Basically a broadcast event bus inserted between nodes.
  *
- *      source
+ *       source
  *         |
  *         v
  *  +----------------+
@@ -54,7 +53,7 @@ impl Link {
         assert_eq!(self.typ, next.into());
         self.latest_value = Some(next);
         for sink in self.sinks.iter_mut() {
-            InputParameter::mark_changed(sink)
+            sink.mark_changed(next);
         }
     }
     fn get_latest(&self) -> Option<Atom> {
@@ -65,9 +64,6 @@ impl Link {
     }
 }
 
-/* Defines behavior and the shape of node state.
- * Each Node in a power graph has a reference to
- */
 trait NodeTemplate {
     fn in_types(&self) -> Vec<AtomDiscriminants>;
     fn out_types(&self) -> Vec<AtomDiscriminants>;
@@ -89,7 +85,7 @@ trait Node {
 
 type CallbackFn = Arc<dyn Fn(Atom, &OutLinkList) -> ()>;
 
-trait NodeState: Default + Any {
+trait NodeState: Default + Any + Debug {
     fn callback_fns(self: &Arc<Self>) -> Vec<CallbackFn>;
 }
 
@@ -100,19 +96,6 @@ struct SimpleNode<StateT: NodeState> {
     out_links: OutLinkList,
     callback_refs: Option<RefCell<Vec<CallbackRef>>>,
 }
-
-/* We want to be able to make new Node impls with minimal repeated code
- * Node impls need to provide
-     * State (in struct, I guess?)
-     * Behavior
-        * Just a list of functions
-        * Might modify state
-     * Ability to hook up new callbacks
-        * A trait-implemented function that converts behavior into list of closures.
- * 
- * We also want callbacks to be clear.
- *
- */
 
 impl<T: NodeState> Node for SimpleNode<T> {
     fn in_links(&self) -> &InLinkList {
@@ -136,19 +119,25 @@ impl<T: NodeState> Node for SimpleNode<T> {
 
 impl<StateT: NodeState + 'static> SimpleNode<StateT> {
     pub fn from_template(template: Arc<dyn NodeTemplate>) -> Arc<RefCell<SimpleNode<StateT>>> {
-        fn initialize_callback_refs<T: NodeState + 'static>(node_ref: &Arc<RefCell<SimpleNode<T>>>) {
+        fn initialize_callback_refs<T: NodeState + 'static>(
+            node_ref: &Arc<RefCell<SimpleNode<T>>>,
+        ) {
             let mut node = node_ref.borrow_mut();
             if node.callback_refs.is_none() {
-                node.callback_refs = Some(RefCell::new(T::callback_fns(&node.state).into_iter().map(
-                    |f: CallbackFn| -> CallbackRef {
-                        let inner_node_ref: Weak<RefCell<SimpleNode<T>>> = Arc::downgrade(&node_ref);
-                        Arc::new(move |atom| {
-                            inner_node_ref.upgrade().map(
-                                |inner_node| f(atom, &inner_node.borrow().out_links)
-                            );
+                node.callback_refs = Some(RefCell::new(
+                    T::callback_fns(&node.state)
+                        .into_iter()
+                        .map(|f: CallbackFn| -> CallbackRef {
+                            let inner_node_ref: Weak<RefCell<SimpleNode<T>>> =
+                                Arc::downgrade(&node_ref);
+                            Arc::new(move |atom| {
+                                inner_node_ref
+                                    .upgrade()
+                                    .map(|inner_node| f(atom, &inner_node.borrow().out_links));
+                            })
                         })
-                    }
-                ).collect()));
+                        .collect(),
+                ));
             }
         }
 
@@ -179,8 +168,12 @@ struct InputParameter {
 }
 
 impl InputParameter {
-    pub fn mark_changed(&self) {
-        // TODO: propagate somehow
+    pub fn mark_changed(&self, value: Atom) {
+        self.node
+            .upgrade()
+            .unwrap()
+            .borrow()
+            .get_callback_ref(self.idx)(value);
     }
 }
 
@@ -226,21 +219,14 @@ fn attach(from_param: &OutputParameter, to_param: &InputParameter) {
         assert_eq!(from_param.typ, to_param.typ);
 
         src.out_links()[from_param.idx]
-            // .as_ref()
             .borrow_mut()
             .add_sink(&to_param);
         // TODO: Attach in-link (not used, but good for bidirectionally showing structure of graph)
     }
 }
 
-/*
-fn generate(templates: Vec<Box<dyn NodeTemplate>>) {
-    Vec<Box<
-}
-*/
-
 #[cfg(test)]
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct EmitUsizeState {}
 
 #[cfg(test)]
@@ -258,11 +244,9 @@ struct EmitUsizeTemplate {
 #[cfg(test)]
 impl EmitUsizeTemplate {
     fn new() -> Arc<Self> {
-        let ret = Arc::new(
-            Self {
-                weak_self: WeakSelf::new(),
-            }
-        );
+        let ret = Arc::new(Self {
+            weak_self: WeakSelf::new(),
+        });
         ret.weak_self.init(&ret);
         ret.into()
     }
@@ -282,37 +266,24 @@ impl NodeTemplate for EmitUsizeTemplate {
 }
 
 #[cfg(test)]
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct TakeUsizeState {
     received: usize,
-}
-
-/* Does NodeState need access to a weak-ptr to itself?
- * I guess it does.
- * How to supply?
- *
- */
-
-#[cfg(test)]
-impl TakeUsizeState {
-    fn take(&mut self, recv: usize) {
-        self.received = recv;
-    }
 }
 
 #[cfg(test)]
 impl NodeState for RefCell<TakeUsizeState> {
     fn callback_fns(self: &Arc<Self>) -> Vec<CallbackFn> {
         let weak_self = Arc::downgrade(self);
-        vec![
-            Arc::new(move |atom: Atom, links: &OutLinkList| -> () {
-                if let Atom::TestUsize(v) = atom {
-                    weak_self.upgrade().map(|self_| {
-                        self_.borrow_mut().received = v;
-                    });
-                };
-            })
-        ]
+        vec![Arc::new(move |atom: Atom, links: &OutLinkList| -> () {
+            if let Atom::TestUsize(v) = atom {
+                weak_self.upgrade().map(|self_| {
+                    self_.borrow_mut().received = v;
+                });
+            } else {
+                panic!("wtf");
+            }
+        })]
     }
 }
 
@@ -324,16 +295,13 @@ struct TakeUsizeTemplate {
 #[cfg(test)]
 impl TakeUsizeTemplate {
     fn new() -> Arc<Self> {
-        let ret = Arc::new(
-            Self {
-                weak_self: WeakSelf::new(),
-            }
-        );
+        let ret = Arc::new(Self {
+            weak_self: WeakSelf::new(),
+        });
         ret.weak_self.init(&ret);
         ret
     }
 }
-
 
 #[cfg(test)]
 impl NodeTemplate for TakeUsizeTemplate {
@@ -344,7 +312,9 @@ impl NodeTemplate for TakeUsizeTemplate {
         vec![]
     }
     fn create(&self) -> Arc<RefCell<dyn Node>> {
-        SimpleNode::<RefCell<TakeUsizeState>>::from_template(self.weak_self.get().upgrade().unwrap())
+        SimpleNode::<RefCell<TakeUsizeState>>::from_template(
+            self.weak_self.get().upgrade().unwrap(),
+        )
     }
 }
 
@@ -361,7 +331,17 @@ mod tests {
 
         attach(&out_params(&a)[0], &in_params(&b)[0]);
 
-        a.borrow().out_links()[0].borrow_mut().update(Atom::TestUsize(5));
-        assert_eq!(5, b.borrow().state().downcast_ref::<RefCell<TakeUsizeState>>().unwrap().borrow().received);
+        a.borrow().out_links()[0]
+            .borrow_mut()
+            .update(Atom::TestUsize(5));
+        assert_eq!(
+            5,
+            b.borrow()
+                .state()
+                .downcast_ref::<RefCell<TakeUsizeState>>()
+                .unwrap()
+                .borrow()
+                .received
+        );
     }
 }
