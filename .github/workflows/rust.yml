@@ -9,6 +9,10 @@ jobs:
 
     steps:
     - uses: actions/checkout@v2
+    - name: rustup 1.41.0
+      uses: actions-rs/toolchain@v1.0.5
+      with:
+        toolchain: 1.41.0
     - name: Build
       run: cargo build --verbose
     - name: Run tests
