@@ -100,7 +100,7 @@ trait Node {
 type CallbackFn = Arc<dyn Fn(Atom, &OutLinkList) -> ()>;
 
 trait NodeState: Default + Any + Debug {
-    fn callback_fns(self: &Arc<Self>) -> Vec<CallbackFn>;
+    fn callback_fns(self: Arc<Self>) -> Vec<CallbackFn>;
 }
 
 struct SimpleNode<StateT: NodeState> {
@@ -139,7 +139,7 @@ impl<StateT: NodeState + 'static> SimpleNode<StateT> {
             let mut node = node_ref.borrow_mut();
             if node.callback_refs.is_none() {
                 node.callback_refs = Some(RefCell::new(
-                    T::callback_fns(&node.state)
+                    T::callback_fns(node.state.clone())
                         .into_iter()
                         .map(|f: CallbackFn| -> CallbackRef {
                             let inner_node_ref: Weak<RefCell<SimpleNode<T>>> =
@@ -326,7 +326,7 @@ struct EmitUsizeState {}
 
 #[cfg(test)]
 impl NodeState for EmitUsizeState {
-    fn callback_fns(self: &Arc<Self>) -> Vec<CallbackFn> {
+    fn callback_fns(self: Arc<Self>) -> Vec<CallbackFn> {
         vec![]
     }
 }
@@ -368,8 +368,8 @@ struct TakeUsizeState {
 
 #[cfg(test)]
 impl NodeState for RefCell<TakeUsizeState> {
-    fn callback_fns(self: &Arc<Self>) -> Vec<CallbackFn> {
-        let weak_self = Arc::downgrade(self);
+    fn callback_fns(self: Arc<Self>) -> Vec<CallbackFn> {
+        let weak_self = Arc::downgrade(&self);
         vec![Arc::new(move |atom: Atom, links: &OutLinkList| -> () {
             if let Atom::TestUsize(v) = atom {
                 weak_self.upgrade().map(|self_| {
