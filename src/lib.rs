@@ -14,7 +14,7 @@ use weak_self::WeakSelf;
 
 #[derive(Debug, Copy, Clone, EnumDiscriminants)]
 #[strum_discriminants(derive(Hash))]
-enum Atom {
+pub enum Atom {
     // Pos(Vec2d),
     // Direction(Vec2d),
     Entity(u8),
@@ -38,28 +38,28 @@ enum Atom {
  *  (... |callbacks|)
  */
 
-struct Link {
+pub struct Link {
     typ: AtomDiscriminants,
     latest_value: Option<Atom>,
     sinks: Vec<InputParameter>,
 }
 
 impl Link {
-    fn new(typ: AtomDiscriminants) -> Self {
+    pub fn new(typ: AtomDiscriminants) -> Self {
         Self {
             typ,
             latest_value: None,
             sinks: vec![],
         }
     }
-    fn update(&mut self, next: Atom) {
+    pub fn update(&mut self, next: Atom) {
         assert_eq!(self.typ, next.into());
         self.latest_value = Some(next);
         for sink in self.sinks.iter_mut() {
             sink.mark_changed(next);
         }
     }
-    fn get_latest(&self) -> Option<Atom> {
+    pub fn get_latest(&self) -> Option<Atom> {
         self.latest_value
     }
     fn add_sink(&mut self, sink: &InputParameter) {
@@ -67,13 +67,13 @@ impl Link {
     }
 }
 
-trait NodeTemplate {
+pub trait NodeTemplate {
     fn in_types(&self) -> Vec<AtomDiscriminants>;
     fn out_types(&self) -> Vec<AtomDiscriminants>;
     fn create(&self) -> Arc<RefCell<dyn Node>>;
 }
 
-impl Debug for NodeTemplate {
+impl Debug for dyn NodeTemplate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -88,7 +88,7 @@ type CallbackRef = Arc<dyn Fn(Atom) -> ()>;
 type InLinkList = Vec<Option<Arc<RefCell<Link>>>>;
 type OutLinkList = Vec<Arc<RefCell<Link>>>;
 
-trait Node {
+pub trait Node {
     fn in_links(&self) -> &InLinkList;
     fn out_links(&self) -> &OutLinkList;
     fn template(&self) -> &Arc<dyn NodeTemplate>;
@@ -99,11 +99,11 @@ trait Node {
 
 type CallbackFn = Arc<dyn Fn(Atom, &OutLinkList) -> ()>;
 
-trait NodeState: Default + Any + Debug {
+pub trait NodeState: Default + Any + Debug {
     fn callback_fns(self: Arc<Self>) -> Vec<CallbackFn>;
 }
 
-struct SimpleNode<StateT: NodeState> {
+pub struct SimpleNode<StateT: NodeState> {
     in_links: InLinkList,
     template: Arc<dyn NodeTemplate>,
     state: Arc<StateT>,
@@ -145,9 +145,9 @@ impl<StateT: NodeState + 'static> SimpleNode<StateT> {
                             let inner_node_ref: Weak<RefCell<SimpleNode<T>>> =
                                 Arc::downgrade(&node_ref);
                             Arc::new(move |atom| {
-                                inner_node_ref
-                                    .upgrade()
-                                    .map(|inner_node| f(atom, &inner_node.borrow().out_links));
+                                if let Some(inner_node) = inner_node_ref.upgrade() {
+                                    f(atom, &inner_node.borrow().out_links);
+                                }
                             })
                         })
                         .collect(),
@@ -162,20 +162,20 @@ impl<StateT: NodeState + 'static> SimpleNode<StateT> {
             .map(|typ| Arc::new(RefCell::new(Link::new(*typ))))
             .collect();
         let state = Arc::new(Default::default());
-        let ret = Arc::new(RefCell::new(Self {
+        let simple_node = Arc::new(RefCell::new(Self {
             in_links,
             out_links,
             template: template.clone(),
             state,
             callback_refs: None,
         }));
-        initialize_callback_refs(&ret);
-        return ret;
+        initialize_callback_refs(&simple_node);
+        simple_node
     }
 }
 
 #[derive(Clone)]
-struct InputParameter {
+pub struct InputParameter {
     node: Weak<RefCell<dyn Node>>,
     idx: usize,
     typ: AtomDiscriminants,
@@ -191,7 +191,7 @@ impl InputParameter {
     }
 }
 
-fn in_params(node: &Arc<RefCell<dyn Node>>) -> Vec<InputParameter> {
+pub fn in_params(node: &Arc<RefCell<dyn Node>>) -> Vec<InputParameter> {
     node.borrow()
         .template()
         .in_types()
@@ -206,13 +206,13 @@ fn in_params(node: &Arc<RefCell<dyn Node>>) -> Vec<InputParameter> {
 }
 
 #[derive(Clone)]
-struct OutputParameter {
+pub struct OutputParameter {
     node: Weak<RefCell<dyn Node>>,
     idx: usize,
     typ: AtomDiscriminants,
 }
 
-fn out_params(node: &Arc<RefCell<dyn Node>>) -> Vec<OutputParameter> {
+pub fn out_params(node: &Arc<RefCell<dyn Node>>) -> Vec<OutputParameter> {
     node.borrow()
         .template()
         .out_types()
@@ -226,7 +226,7 @@ fn out_params(node: &Arc<RefCell<dyn Node>>) -> Vec<OutputParameter> {
         .collect()
 }
 
-fn attach(from_param: &OutputParameter, to_param: &InputParameter) {
+pub fn attach(from_param: &OutputParameter, to_param: &InputParameter) {
     if let Some(src_ref) = from_param.node.upgrade() {
         let src = src_ref.borrow_mut();
 
@@ -253,12 +253,12 @@ fn contains(haystack: &TypeMultiset, needle: &TypeMultiset) -> bool {
 fn type_set(types: Vec<AtomDiscriminants>) -> TypeMultiset {
     let mut counts = TypeMultiset::new();
     for typ in types {
-        *counts.entry(typ.into()).or_insert(0) += 1;
+        *counts.entry(typ).or_insert(0) += 1;
     }
     counts
 }
 
-fn generate_graphs(templates: &Vec<Arc<dyn NodeTemplate>>) -> Vec<Vec<&Arc<dyn NodeTemplate>>> {
+pub fn generate_graphs(templates: &[Arc<dyn NodeTemplate>]) -> Vec<Vec<&Arc<dyn NodeTemplate>>> {
     /* Returns the input nodes of a generated power graph. Generation occurs in two stages:
      *
      * 1. Using type annotations, create a potential topsort of the graph's templates
@@ -290,7 +290,7 @@ fn generate_graphs(templates: &Vec<Arc<dyn NodeTemplate>>) -> Vec<Vec<&Arc<dyn N
 
     let mut results = Vec::new();
 
-    for i in 1..5 {
+    for _i in 1..5 {
         if let Some((available_types, prev_templates)) = search_q.pop_front() {
             for (in_type_set, next_template, out_type_set) in templates_by_type
                 .iter()
@@ -370,13 +370,13 @@ struct TakeUsizeState {
 impl NodeState for RefCell<TakeUsizeState> {
     fn callback_fns(self: Arc<Self>) -> Vec<CallbackFn> {
         let weak_self = Arc::downgrade(&self);
-        vec![Arc::new(move |atom: Atom, links: &OutLinkList| -> () {
+        vec![Arc::new(move |atom: Atom, _links: &OutLinkList| -> () {
             if let Atom::TestUsize(v) = atom {
-                weak_self.upgrade().map(|self_| {
+                if let Some(self_) = weak_self.upgrade() {
                     self_.borrow_mut().received = v;
-                });
+                };
             } else {
-                panic!("wtf");
+                panic!("Passed wrong type");
             }
         })]
     }
