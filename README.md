@@ -14,7 +14,7 @@ Say you're writing a game and you want to procedurally generate projectiles with
 +------------+             +----------+
 ```
 
-This project is me trying to pretty dramatically this. I want to procedurally fit together pieces like
+This project is me trying to generalize this to larger graphs, containing nodes that might have more than one input and more than one output. I want to procedurally fit together pieces like
 
 ```
  position -> +------------+
